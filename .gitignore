@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 运行产物(可再生产生)
+best_params.jsonc
+
+# ============ 含个人信息的文件: 一律不进版本库 ============
+# 实验报告封面含真实姓名 / 学号 / 学院 / 班级 / 实验室, 不能公开:
+#   lris数据软间隔SVM分类实验报告.docx  —— 生成的报告本体
+#   .report_template.docx               —— 空白模板(封面同样含个人信息)
+#   report_preview.html                 —— 报告的 HTML 预览(内容与报告一致)
+# 报告由 build_report.py 从本地模板重新生成, 不需要入库。
+*.docx
+report_preview.html
+.report_template.docx
+
+# 兜底: 万一有其它导出格式
+~$*.docx
+*.doc
+*.pdf
+
+# 图片是 README 的展示内容, 纳入版本库(不再忽略):
+#   iris_weights.png
+#   figures/*.png
