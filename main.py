@@ -10,6 +10,14 @@
     python main.py --data D:/x/iris.data --best ./best_params.jsonc
     python main.py --no-auto-download  # 缺数据时报错提示，不自动下载
     python main.py -q                  # 静默（只输出 warn/fail）
+
+环境（自动）
+------------
+直接 `python main.py` / `./main.py` 即可：启动时先自举虚拟环境 —— 若当前解释器不是
+setup_env.py 装好的那个（默认 ./.venv），会自动切换过去；环境不存在或依赖不全时
+自动调用 setup_env.py 安装（详见 src/lris/venv_boot.py）。
+    想强制用当前解释器: LRIS_NO_VENV=1 python main.py
+    想指定其它环境:     LRIS_VENV=/path/to/env python main.py
 """
 from __future__ import annotations
 
@@ -26,20 +34,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parent
 SRC_DIR = ROOT / "src"
+
+# 把 src 加入 sys.path：这样无论从哪个工作目录运行都能 import lris.*
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# 虚拟环境自举 —— 必须在 import numpy / matplotlib 之前执行（否则裸解释器直接 ImportError）。
+try:
+    from lris.venv_boot import ensure_project_venv  # noqa: E402
+
+except ImportError as exc:  # 例如只拷走了 main.py
+    raise SystemExit(f"[fail] 无法导入虚拟环境自举模块 {SRC_DIR / 'lris' / 'venv_boot.py'}: {exc}")
+
+ensure_project_venv(("numpy", "matplotlib"))
+
+import numpy as np  # noqa: E402  （自举完成后再导入第三方依赖）
+
 DEFAULT_DATA = ROOT / "iris.data"
 DEFAULT_BEST = ROOT / "best_params.jsonc"
 MODEL_SCRIPT = SRC_DIR / "lris" / "iris_model.py"
 DOWNLOAD_SCRIPT = ROOT / "download_data.py"
 FIGURES_DIR = ROOT / "figures"
-
-# 复用项目内的 JSONC 解析器（src/lris/jsonc.py，只依赖标准库）。
-# 把 src 加入 sys.path 后即可 import lris.jsonc，这样无论从哪个工作目录运行都能找到它。
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 try:
     from lris.jsonc import loads_jsonc  # noqa: E402  （必须在 sys.path 配置之后导入）

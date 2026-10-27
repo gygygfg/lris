@@ -29,18 +29,31 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
-# 某些环境 HOME 下的 config 目录不可写, 会打印 MPLCONFIGDIR 警告; 提前指向可写临时目录
-os.environ.setdefault("MPLCONFIGDIR", str(Path(os.environ.get("TMPDIR", "/tmp")) / "mplconfig"))
+# 某些环境 HOME 下的 config 目录不可写, 会打印 MPLCONFIGDIR 警告; 提前指向可写临时目录。
+# 注意：不能用硬编码的 /tmp —— Windows 上根本没有该路径（已有同项目 main.py 的写法为证）。
+os.environ.setdefault(
+    "MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "mplconfig")
+)
 
-import matplotlib
+# 虚拟环境自举 —— 必须在 import matplotlib / numpy 之前（否则裸解释器直接 ImportError）。
+# 本文件两种跑法都要支持：python src/lris/iris_model.py（同目录模块）/ 作为包导入
+try:
+    from .venv_boot import ensure_project_venv
+except ImportError:  # 以脚本方式运行: 退化为同目录模块
+    from venv_boot import ensure_project_venv  # pyright: ignore[reportMissingImports]
+
+ensure_project_venv(("numpy", "matplotlib"))
+
+import matplotlib  # noqa: E402  （自举完成后再导入第三方依赖）
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
-import numpy as np
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 
 try:  # 作为包导入 (import lris.iris_model)
     from .jsonc import load_jsonc

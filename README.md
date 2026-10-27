@@ -117,6 +117,69 @@ uv sync      # 安装依赖
 uv run lris  # 训练 + 筛选 + 出图 + 缓存
 ```
 
+### 不想手动管环境：直接跑就行（自动自举虚拟环境）
+
+`main.py` 与 `src/lris/iris_model.py` 启动时会先做「虚拟环境自举」
+（实现见 `src/lris/venv_boot.py`，纯标准库，不依赖任何第三方包）：
+
+1. 从脚本位置向上找到项目根（含 `pyproject.toml`），定位 `setup_env.py` 装好的环境
+   （`$LRIS_VENV` → `./.venv` → `./venv` → conda 同名环境 `lris`）；
+2. 当前解释器**不是**它 → 换成该环境的解释器重跑同一条命令
+   （POSIX 用 `os.execv` 原地替换，PID / 信号 / 退出码都不变；Windows 用子进程透传退出码）；
+3. 环境不存在或依赖没装全 → 自动调用 `setup_env.py` 装好，再切过去。
+
+**不会重复安装**（三道闸门）：
+
+| 闸门 | 作用 |
+|---|---|
+| ① 纯文件系统自检 | 环境目录 + 解释器 + `site-packages` 里有依赖 → 直接使用，零子进程、零联网 |
+| ② `setup_env.py --check` 复核 | 仅当 ① 判定"不完整"才执行；**只读不装**（不创建、不安装、不联网），返回 0 就直接用（挡住 dist-info 命名 / `.pth` / 自定义布局等误判） |
+| ③ 真正安装只做一次 | 仅当 ② 明确回报缺依赖（退出码 3）或没有环境（4）才跑 `setup_env.py`；`uv sync` 本身幂等，且同一进程内 `LRIS_VENV_SETUP_TRIED` 保证不再重试 |
+
+即：环境本来就好的情况下，`python main.py` **不会**触发任何安装动作。
+
+#### Windows / Linux / macOS 行为一致
+
+同一份实现按平台自动切换，无需在 Windows 上做任何额外操作：
+
+| 差异点 | Linux / macOS / WSL | Windows |
+|---|---|---|
+| 环境解释器 | `.venv/bin/python` | `.venv\Scripts\python.exe`（含 `python3.exe` 别名） |
+| site-packages | `.venv/lib/python3.X/site-packages` | `.venv\Lib\site-packages` |
+| 切换方式 | `os.execv` 原地替换（PID / 信号 / 退出码不变） | 子进程 + 退出码透传（Windows 的 `execv` 语义不同，故不走它） |
+| 路径比较 | 大小写敏感，按字面量 | `normcase` 归一化：不区分大小写 / 正反斜杠 / 盘符 |
+| 控制台编码 | 本就 UTF-8 | 输出重定向时是 cp936/cp1252，自举与 `setup_env.py` 都提前 `reconfigure(encoding="utf-8")`，中文不再崩或变问号 |
+| 找 Python | `python3` / `python` | `sys.executable` → `python` → `py -3` 逐级兜底 |
+| 临时目录 | `/tmp` | `tempfile.gettempdir()`（`MPLCONFIGDIR` 不再硬编码 `/tmp`） |
+
+Windows 上的两种等价写法：
+
+```bat
+python main.py
+python src\lris\iris_model.py
+```
+
+> `setup.cmd` 是 Windows 的环境搭建启动器（自动找 `py -3` / `python` / 常见安装路径），
+> 与 Linux 的 `setup.sh` 共用同一份 `setup_env.py` 实现。
+
+所以下面这些写法在任何环境的裸 Python 下都能一次成功，不需要先 `activate`：
+
+```bash
+python main.py                              # 任意 python 3.8+（Windows 同）
+./main.py --stage load                      # 有可执行位时等价（仅 POSIX）
+python src/lris/iris_model.py                # 直跑模型脚本也会自动用 .venv
+```
+
+| 环境变量 | 作用 |
+|---|---|
+| `LRIS_NO_VENV=1` | 关闭自举，强制用当前解释器 |
+| `LRIS_VENV=/path/to/env` | 指定别的环境（也可直接给解释器路径） |
+| `LRIS_NO_AUTO_SETUP=1` | 缺少环境时只提示，不自动运行 `setup_env.py` |
+
+> Windows 上设置临时环境变量：`set LRIS_NO_VENV=1`（CMD）或 `$env:LRIS_NO_VENV=1`（PowerShell）。
+
+> `download_data.py` / `build_report.py` 是纯标准库脚本，不参与自举，裸 Python 也能直接跑。
+
 ## 数据
 
 `iris.data`：UCI Iris，150 行，4 特征 + 1 标签，三类各 50 条。
@@ -511,6 +574,8 @@ setosa 相关的两个子问题几乎全部落在 `f > 1` 一侧，说明这三�
 ```
 src/lris/
 ├── __init__.py      # 导出 main
+├── jsonc.py         # 标准库 JSONC 解析器（main.py 与 iris_model.py 共用）
+├── venv_boot.py     # 入口脚本的虚拟环境自举（自动切到 .venv / 缺环境时自动安装）
 └── iris_model.py
     ├── load_iris          读取并格式化数据
     ├── quantize_step      间隔 s = 特征方差均值

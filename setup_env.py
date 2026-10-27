@@ -19,9 +19,11 @@
 
 退出码
 ------
-    0  成功
+    0  成功（--check：环境已就绪，无需安装）
     1  安装失败（所有可选路线均失败）
     2  解析或配置错误（如找不到 pyproject.toml），此阶段不产生任何副作用
+    3  --check：环境存在但依赖不全，需要安装
+    4  --check：未找到已存在的环境
 """
 
 from __future__ import annotations
@@ -43,6 +45,8 @@ __version__ = "1.0.0"
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_CONFIG = 2
+EXIT_NEED_INSTALL = 3   # --check：环境存在但依赖不全（需要安装）
+EXIT_NO_ENV = 4         # --check：根本没找到已存在的环境
 
 IS_WINDOWS = os.name == "nt"
 
@@ -102,6 +106,23 @@ LOG = Logger()
 def set_logger(logger: Logger) -> None:
     global LOG
     LOG = logger
+
+
+def configure_stdio() -> None:
+    """把 stdout/stderr 统一改成 UTF-8。
+
+    Windows 上直接输出到控制台时 Python 走 WriteConsoleW（本身是 UTF-8，不会出错），
+    但**重定向**到文件/管道时编码变成 cp936/cp1252，中文日志会 UnicodeEncodeError
+    并降级成一串问号。这里与 main.py / venv_boot.py 保持一致，尽早改成 utf-8。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # 被重定向到非 TextIOWrapper（如管道/测试替身）时跳过
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 # --------------------------------------------------------------------------------------
@@ -1515,10 +1536,11 @@ class RouteOutcome:
     def __init__(self, kind: str) -> None:
         self.kind = kind
         self.ok = False
-        self.env_path = None      # Path
-        self.env_python = None    # [argv...]
+        # 函数体内的局部变量注解不会在运行时求值，3.8 也能用 Path | None 写法
+        self.env_path: "Path | None" = None        # 环境目录
+        self.env_python: "list[str] | None" = None  # [argv...] 环境内解释器
         self.conda_name = ""
-        self.conda_base = None    # Path
+        self.conda_base: "Path | None" = None
         self.project_installed = False
         self.message = ""
 
@@ -1914,8 +1936,14 @@ def _run_python_probe(env_python, args, extra_env=None):
     return CmdResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
-def verify_env(cfg: ProjectConfig, outcome: RouteOutcome, opts):
-    """返回 dict：deps/project/scripts 与总体 ok 标志。"""
+def verify_env(cfg: ProjectConfig, outcome: RouteOutcome, opts, require_scripts: bool = True):
+    """返回 dict：deps/project/scripts 与总体 ok 标志。
+
+    require_scripts=False 供 --check 使用：判断「能否 import 依赖与项目本体」即可，
+    不把「缺 console script」当失败。否则某些安装方式（--no-project-install、
+    纯 .pth 可编辑安装、Windows 上未生成 Scripts\\xxx.exe）会让 --check 永远返回
+    “需要安装”，入口脚本每次都重跑 setup_env.py —— 即重复安装。
+    """
     report = {"deps": [], "project": None, "scripts": [], "ok": True, "skipped": False}
     if opts.no_verify:
         report["skipped"] = True
@@ -2007,8 +2035,9 @@ def verify_env(cfg: ProjectConfig, outcome: RouteOutcome, opts):
         exists = bool(path and path.is_file())
         report["scripts"].append({"name": name, "path": str(path) if path else "",
                                  "ok": exists})
-        if not exists:
+        if not exists and require_scripts:
             report["ok"] = False
+    report["scripts_required"] = require_scripts
     return report
 
 
@@ -2161,6 +2190,10 @@ EPILOG = """\
   python3 setup_env.py --dry-run
         只打印解析结果与将要执行的命令，不做任何改动
 
+  python3 setup_env.py --check
+        只检查已存在的环境是否够用：不创建、不安装、不联网
+        退出码 0=已就绪 / 3=缺依赖 / 4=没有环境（入口脚本自举时用它避免重复安装）
+
   python3 setup_env.py --manager venv
         跳过 conda/uv，直接用系统 Python 建 .venv
 
@@ -2202,6 +2235,9 @@ def build_parser():
     parser.add_argument("--no-project-install", action="store_true",
                         help="只装依赖，不把项目本体装进环境")
     parser.add_argument("--no-verify", action="store_true", help="跳过安装后的校验")
+    parser.add_argument("--check", "--verify-only", action="store_true", dest="check",
+                        help="只检查已存在的环境是否够用，不做任何安装（0=就绪 3=缺依赖 "
+                             "4=没有环境）；供入口脚本判断是否需要安装")
     parser.add_argument("--offline", action="store_true",
                         help="离线模式：不发起网络安装，只复用/校验已有环境")
     parser.add_argument("--dry-run", action="store_true",
@@ -2242,10 +2278,105 @@ def print_plan_only_note(runner: Runner) -> None:
         LOG.info("（本次 dry-run 没有需要执行的命令）")
 
 
+def locate_existing_envs(cfg, opts):
+    """只「看」不「动」：按 uv/venv > conda 的顺序收集已存在的环境。
+
+    不创建目录、不联网、不执行任何包管理器命令（conda 只读 `env list --json`），
+    供 --check 使用，也供入口脚本判断「要不要真的装」。
+    """
+    found = []
+    seen = set()
+
+    def add(kind, env_path, env_python):
+        try:
+            key = os.path.normcase(os.path.abspath(str(env_path)))
+        except (OSError, ValueError):
+            key = str(env_path)
+        if key in seen:
+            return
+        seen.add(key)
+        out = RouteOutcome(kind)
+        out.env_path = Path(env_path)
+        out.env_python = [str(env_python)]
+        out.ok = True
+        found.append(out)
+
+    # ---- uv / 原版 venv：项目根下的三个约定目录 ----
+    for name in (".venv", "venv", ".virtualenv"):
+        env_dir = cfg.root / name
+        py = venv_python(env_dir)
+        if py.is_file():
+            add("venv", env_dir, py)
+
+    # ---- conda：base 或同名环境 ----
+    try:
+        ana, mini = detect_conda()
+    except Exception:  # conda 探测失败不影响其它路线
+        ana = mini = None
+    conda_info = next((m for m in (ana, mini) if m is not None and m.exe), None)
+    if conda_info is not None:
+        name = conda_safe_name(opts.name or cfg.name)
+        base, envs = conda_env_info(conda_info.exe)
+        for path in ([envs.get(name)] if name in envs else []) + ([base] if base else []):
+            if not path:
+                continue
+            py = venv_python(path)
+            if py.is_file():
+                add("conda", path, py)
+
+    return found
+
+
+def print_check_report(cfg, envs, results):
+    """--check 的简洁报告：每个环境的路径 + 缺了什么。"""
+    LOG.plain("── 环境检查（--check：只检测，不安装）──────────────────────")
+    for outcome, report in results:
+        state = "通过" if report.get("ok") else "不完整"
+        LOG.plain("  环境        : %s（%s）" % (outcome.env_python[0], state))
+        if report.get("skipped"):
+            LOG.plain("  校验        : 跳过（%s）" % (
+                report.get("reason") or "无法读取该环境"))
+            continue
+        for item in report.get("deps", []):
+            LOG.plain("    %-6s %-24s %s"
+                      % ("[ok]" if item["ok"] else "[缺少]", item["name"], item["detail"]))
+        project = report.get("project")
+        if project:
+            LOG.plain("    项目本体 %-24s %s"
+                      % (project["name"], "OK" if project["ok"] else project["detail"]))
+        for item in report.get("scripts", []):
+            # console script 缺失不影响 python main.py，只提示（不参与判定）
+            LOG.plain("    入口脚本 %-24s %s"
+                      % (item["name"], "OK" if item["ok"] else "未生成（不影响直接运行脚本）"))
+
+
+def run_check(cfg, opts) -> int:
+    """--check 实现：0=已就绪 3=需要安装 4=没有环境。全程不写盘、不联网。"""
+    envs = locate_existing_envs(cfg, opts)
+    if not envs:
+        LOG.plain("── 环境检查（--check：只检测，不安装）──────────────────────")
+        LOG.plain("  结果        : 未找到已存在的环境（%s）" % (cfg.root / ".venv"))
+        return EXIT_NO_ENV
+
+    results = []
+    for outcome in envs:
+        report = verify_env(cfg, outcome, opts, require_scripts=False)
+        results.append((outcome, report))
+        if report.get("ok"):
+            print_check_report(cfg, envs, results)
+            LOG.ok("环境已就绪，无需安装")
+            return EXIT_OK
+
+    print_check_report(cfg, envs, results)
+    LOG.warn("环境不完整，需要安装缺失依赖")
+    return EXIT_NEED_INSTALL
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     opts = parser.parse_args(argv)
     set_logger(Logger(quiet=opts.quiet, verbose=opts.verbose))
+    configure_stdio()  # 尽早：Windows 控制台 cp936 下中文日志才不会变问号
 
     LOG.info("setup_env.py %s（Python %s，%s）"
              % (__version__, ".".join(str(v) for v in sys.version_info[:3]),
@@ -2266,6 +2397,9 @@ def main(argv=None) -> int:
             import traceback
             traceback.print_exc()
         return EXIT_CONFIG
+
+    if opts.check:  # 只检测：不创建、不安装、不联网（供入口脚本自举时预检）
+        return run_check(cfg, opts)
 
     print_parse_report(cfg, opts)
 
